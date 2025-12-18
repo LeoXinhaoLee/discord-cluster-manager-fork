@@ -24,7 +24,7 @@ class ModalLauncher(Launcher):
         if config["lang"] == "cu":
             config["include_dirs"] = config.get("include_dirs", []) + self.additional_include_dirs
         func_type = "pytorch" if config["lang"] == "py" else "cuda"
-        func_name = f"run_{func_type}_script_{gpu_type.value.lower()}"
+        func_name = f"run_{func_type}_script_{gpu_type.value.lower()}_daniel_test"
 
         logger.info(f"Starting Modal run using {func_name}")
 
