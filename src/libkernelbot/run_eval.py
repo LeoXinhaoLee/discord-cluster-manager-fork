@@ -68,6 +68,7 @@ class SystemInfo:
     platform: str = ''      # Platform string of the machine
     torch: str = ''         # Torch version
     hostname: str = ''      # Hostname of the machine
+    requeues: int = 0       # How many Modal requeues/retries were used before running
     # fmt: on
 
 

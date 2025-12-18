@@ -296,6 +296,7 @@ Running on:
 * GPU: `{system.gpu}`
 * CPU: `{system.cpu}`
 * Device count: `{system.device_count}`
+* Requeues: `{system.requeues}`
 * Runtime: `{system.runtime}`
 * Platform: `{system.platform}`
 * Torch: `{system.torch}`
