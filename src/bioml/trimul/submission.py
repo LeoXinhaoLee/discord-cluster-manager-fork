@@ -1,98 +1,99 @@
 import torch
-from torch import nn, einsum
-from task import input_t, output_t
+import torch.nn.functional as F
 
-class TriMul(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        hidden_dim: int,
-    ):
-        super().__init__()
-
-        self.norm = nn.LayerNorm(dim)
-
-        self.left_proj = nn.Linear(dim, hidden_dim, bias=False, dtype=torch.float32)
-        self.right_proj = nn.Linear(dim, hidden_dim, bias=False, dtype=torch.float32)
-
-        self.left_gate = nn.Linear(dim, hidden_dim, bias=False, dtype=torch.float32)
-        self.right_gate = nn.Linear(dim, hidden_dim, bias=False, dtype=torch.float32)
-        self.out_gate = nn.Linear(dim, hidden_dim, bias=False, dtype=torch.float32)
-
-        self.to_out_norm = nn.LayerNorm(hidden_dim)
-        self.to_out = nn.Linear(hidden_dim, dim, bias=False, dtype=torch.float32)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        x: [bs, seq_len, seq_len, dim]
-        mask: [bs, seq_len, seq_len]
-
-        Returns:
-            output: [bs, seq_len, seq_len, dim]
-        """
-        batch_size, seq_len, _, dim = x.shape
-
-        x = self.norm(x)
-        x = x.to(torch.float32)
-
-        left = self.left_proj(x.to(torch.float32))
-        right = self.right_proj(x.to(torch.float32))
-
-        mask = mask.unsqueeze(-1)
-        left = left * mask
-        right = right * mask
-
-        left_gate = self.left_gate(x.to(torch.float32)).sigmoid()
-        right_gate = self.right_gate(x.to(torch.float32)).sigmoid()
-        out_gate = self.out_gate(x.to(torch.float32)).sigmoid()
-
-        left = left * left_gate
-        right = right * right_gate
-
-        out = einsum('... i k d, ... j k d -> ... i j d', left.to(torch.bfloat16), right.to(torch.bfloat16))
-        # This einsum is the same as the following:
-        # out = torch.zeros(batch_size, seq_len, seq_len, dim, device=x.device)
-        
-        # # Compute using nested loops
-        # for b in range(batch_size):
-        #     for i in range(seq_len):
-        #         for j in range(seq_len):
-        #             # Compute each output element
-        #             for k in range(seq_len):
-        #                 out[b, i, j] += left[b, i, k, :] * right[b, j, k, :]
-
-        out = out.to(torch.float32)
-        out = self.to_out_norm(out)
-        out = out * out_gate
-        return self.to_out(out)
-
-
-def custom_kernel(data: input_t) -> output_t:
+def custom_kernel(data):
     """
-    Reference implementation of TriMul using PyTorch.
-    
+    Triton‑friendly implementation of the *outgoing* TriMul operator.
+    The heavy inner‑product is performed with a batched GEMM (torch.bmm)
+    which on H100 maps to an efficient cuBLAS kernel.  All other
+    operations (LayerNorm, Linear, Sigmoid gates) are expressed with
+    PyTorch primitives so that the code stays simple while still being
+    completely GPU‑resident.
+
     Args:
-        data: Tuple of (input: torch.Tensor, mask: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
-            - input: Input tensor of shape [batch_size, seq_len, seq_len, dim]
-            - mask: Mask tensor of shape [batch_size, seq_len, seq_len]
-            - weights: Dictionary containing model weights
-            - config: Dictionary containing model configuration parameters
+        data: tuple containing
+            - input_tensor: torch.Tensor of shape [B, N, N, D] (float32/float16)
+            - mask:        torch.Tensor of shape [B, N, N] (bool or float)
+            - weights:     dict of the model’s parameters (all on CUDA)
+            - config:      dict with keys "dim" and "hidden_dim"
+
+    Returns:
+        (output_tensor,) where output_tensor has shape [B, N, N, D] and dtype torch.float16
     """
+    # ----------------------------------------------------------------------
+    # unpack arguments
+    # ----------------------------------------------------------------------
     input_tensor, mask, weights, config = data
-    trimul = TriMul(config["dim"], config["hidden_dim"]).to(input_tensor.device)
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    eps = 1e-5                     # LayerNorm epsilon
 
-    # Fill in the given weights of the model
-    trimul.norm.weight = nn.Parameter(weights['norm.weight'].to(torch.float32))
-    trimul.left_proj.weight = nn.Parameter(weights['left_proj.weight'].to(torch.float32))
-    trimul.right_proj.weight = nn.Parameter(weights['right_proj.weight'].to(torch.float32))
-    trimul.left_gate.weight = nn.Parameter(weights['left_gate.weight'].to(torch.float32))
-    trimul.right_gate.weight = nn.Parameter(weights['right_gate.weight'].to(torch.float32))
-    trimul.out_gate.weight = nn.Parameter(weights['out_gate.weight'].to(torch.float32))
-    trimul.to_out_norm.weight = nn.Parameter(weights['to_out_norm.weight'].to(torch.float32))
-    trimul.to_out.weight = nn.Parameter(weights['to_out.weight'].to(torch.float32))
-    trimul.norm.bias = nn.Parameter(weights['norm.bias'].to(torch.float32))
-    trimul.to_out_norm.bias = nn.Parameter(weights['to_out_norm.bias'].to(torch.float32))
+    # ----------------------------------------------------------------------
+    # 1) Input LayerNorm  (no bias in the reference code – we add bias here)
+    # ----------------------------------------------------------------------
+    # x_norm = (x - μ) / √(σ² + eps) * weight + bias
+    mean = input_tensor.mean(dim=-1, keepdim=True)
+    var  = input_tensor.var(dim=-1, unbiased=False, keepdim=True)
+    x = (input_tensor - mean) / torch.sqrt(var + eps)
+    x = x * weights["norm.weight"] + weights["norm.bias"]
 
-    output = trimul(input_tensor, mask).to(torch.float32)
+    # ----------------------------------------------------------------------
+    # 2) Linear projections (no bias)
+    # ----------------------------------------------------------------------
+    left  = F.linear(x, weights["left_proj.weight"])   # [B,N,N,hidden]
+    right = F.linear(x, weights["right_proj.weight"])
 
-    return output
+    # ----------------------------------------------------------------------
+    # 3) Mask (optional – mask may be all ones)
+    # ----------------------------------------------------------------------
+    mask_f = mask.unsqueeze(-1).to(left.dtype)   # [B,N,N,1]
+    left  = left * mask_f
+    right = right * mask_f
+
+    # ----------------------------------------------------------------------
+    # 4) Gating (sigmoid of linear transforms)
+    # ----------------------------------------------------------------------
+    left_gate  = torch.sigmoid(F.linear(x, weights["left_gate.weight"]))
+    right_gate = torch.sigmoid(F.linear(x, weights["right_gate.weight"]))
+    out_gate   = torch.sigmoid(F.linear(x, weights["out_gate.weight"]))
+
+    left  = left  * left_gate
+    right = right * right_gate
+
+    # ----------------------------------------------------------------------
+    # 5) Core TriMul – batched GEMM over the “k” dimension
+    #    out[b,i,j,d] = Σ_k left[b,i,k,d] * right[b,j,k,d]
+    #    Equivalent to: for each d,  out_d = left_d @ right_dᵀ
+    # ----------------------------------------------------------------------
+    B, N, _, _ = left.shape
+
+    # reshape to (B*hidden, N, N) for a single bmm call
+    left_bmm  = left.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N)
+    right_bmm = right.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N)
+
+    # batch‑matrix‑multiply: (B*hidden, N, N) @ (B*hidden, N, N)ᵀ → (B*hidden, N, N)
+    out_bmm = torch.bmm(left_bmm, right_bmm.transpose(1, 2))
+
+    # reshape back to [B, N, N, hidden]
+    out = out_bmm.reshape(B, hidden_dim, N, N).permute(0, 2, 3, 1)
+
+    # ----------------------------------------------------------------------
+    # 6) Output LayerNorm (again without bias‑term in the reference)
+    # ----------------------------------------------------------------------
+    mean = out.mean(dim=-1, keepdim=True)
+    var  = out.var(dim=-1, unbiased=False, keepdim=True)
+    out = (out - mean) / torch.sqrt(var + eps)
+    out = out * weights["to_out_norm.weight"] + weights["to_out_norm.bias"]
+
+    # ----------------------------------------------------------------------
+    # 7) Apply out‑gate and final linear projection
+    # ----------------------------------------------------------------------
+    out = out * out_gate
+    out = F.linear(out, weights["to_out.weight"])
+
+    # ----------------------------------------------------------------------
+    # 8) Cast to float16 as required by the specification
+    # ----------------------------------------------------------------------
+    out = out.to(torch.float32)
+
+    return out

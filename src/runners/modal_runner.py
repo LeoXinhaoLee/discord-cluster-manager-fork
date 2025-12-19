@@ -11,7 +11,7 @@ from libkernelbot.run_eval import FullResult, SystemInfo, run_config
 
 # Create a stub for the Modal app
 # IMPORTANT: This has to stay in separate file or modal breaks
-app = App("discord-bot-runner")
+app = App("discord-bot-runner-daniel")
 cuda_version = "12.8.0"
 flavor = "devel"
 operating_sys = "ubuntu24.04"

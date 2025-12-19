@@ -381,4 +381,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+#     sys.exit(main())
+    test_args = {"seqlen": 768, "bs": 2, "dim": 128, "hiddendim": 128, "seed": 731, "nomask": True, "distribution": "normal"}
+
+    test_case = TestCase(spec="",args=test_args)
+    _run_single_test(test_case)

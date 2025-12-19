@@ -100,7 +100,6 @@ def ref_kernel(data: input_t) -> output_t:
         trimul.to_out.weight = nn.Parameter(weights['to_out.weight'])
 
         output = trimul(input_tensor, mask)
-
         return output
 
 

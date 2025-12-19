@@ -3,18 +3,20 @@
 Helper script to run the BioML TriMul task on Modal directly, using the
 task definition in `bioml/trimul/task.yml`.
 
-Usage (from project root):
-    uv run python src/run_trimul_modal.py --submission path/to/submission.py
+NEW:
+  - Accepts a JSONL file of generations and runs all submissions asynchronously.
+  - Aggregates:
+      * % failed invocations
+      * mean/median/min/max of overall leaderboard score (microseconds) per JSONL entry
 
-You must:
-  1. Be authenticated with Modal (`modal token new`)
-  2. Have deployed the Modal app:
-         cd src/runners
-         modal deploy modal_runner_archs.py
+Assumes each JSONL line contains a field with the submission code:
+  - tries: "content", then "submission", then "code"
 """
 
 import argparse
 import asyncio
+import json
+import statistics
 from pathlib import Path
 from typing import Optional
 
@@ -67,30 +69,25 @@ async def run_trimul_on_modal(
         gpu_type: One of ModalGPU names (T4, L4, A100, H100, B200, L4x4)
         mode: One of: test, benchmark, leaderboard, profile, private
     """
-    # Load task from bioml/trimul/task.yml
     task = load_trimul_task()
 
-    # Map CLI mode to SubmissionMode enum
     try:
         mode_enum = SubmissionMode(mode)
     except ValueError as e:
         valid = ", ".join(m.value for m in SubmissionMode)
         raise ValueError(f"Invalid mode '{mode}'. Valid modes: {valid}") from e
 
-    # Build config using the same path as the backend
     config = build_task_config(
         task=task,
         submission_content=submission_code,
-        arch=None,  # Python task – arch unused
+        arch=None,
         mode=mode_enum,
     )
 
-    # Set up Modal launcher
     launcher = ModalLauncher(add_include_dirs=[])
     gpu_enum = ModalGPU[gpu_type.upper()]
 
     reporter = SimpleReporter(f"TriMul on {gpu_enum.name} (Modal)")
-
     print(f"Submitting TriMul task to Modal on {gpu_enum.name} with mode='{mode_enum.value}'...")
 
     result = await launcher.run_submission(config, gpu_enum, reporter)
@@ -167,7 +164,7 @@ def print_result(result: FullResult, task: LeaderboardTask | None = None):
             print(f"      Success:  {comp.success}")
             if not comp.success:
                 print(f"      ExitCode: {comp.exit_code}")
-                print(f"      Stderr:   {comp.stderr[:200]}...")
+                print(f"      Stderr:   {comp.stderr}...")
 
         if run_result.run:
             run = run_result.run
@@ -180,9 +177,8 @@ def print_result(result: FullResult, task: LeaderboardTask | None = None):
             if run.stdout:
                 print(f"      Stdout:\n{run.stdout[:500]}{'...' if len(run.stdout) > 500 else ''}")
             if run.stderr:
-                print(f"      Stderr:\n{run.stderr[:500]}{'...' if len(run.stderr) > 500 else ''}")
+                print(f"      Stderr:\n{run.stderr}{'...' if len(run.stderr) > 500 else ''}")
 
-    # If we have a task and a leaderboard run, print per-benchmark stats and score
     if task is not None and "leaderboard" in result.runs:
         print_benchmark_details(result)
         try:
@@ -193,16 +189,108 @@ def print_result(result: FullResult, task: LeaderboardTask | None = None):
             print(f"\nCould not compute leaderboard score: {e}")
 
 
+# ---------------- NEW: JSONL runner + stats ----------------
+
+def _extract_submission_code(d: dict) -> str:
+    # for k in ("content", "submission", "code"):
+    for k in ("postprocessed_content",):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    raise ValueError("Could not find submission code in JSONL line (expected one of: content/submission/code).")
+
+
+async def run_jsonl_on_modal(
+    jsonl_path: Path,
+    gpu_type: str,
+    mode: str,
+    concurrency: int,
+    print_each: bool,
+):
+    lines = jsonl_path.read_text().splitlines()
+    items = [json.loads(line) for line in lines if line.strip()]
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _run_one(idx: int, item: dict):
+        submission_code = _extract_submission_code(item)
+        async with sem:
+            try:
+                result, task = await run_trimul_on_modal(
+                    submission_code=submission_code,
+                    gpu_type=gpu_type,
+                    mode=mode,
+                )
+            except Exception as e:
+                return {"idx": idx, "ok": False, "error": f"{type(e).__name__}: {e}", "score_us": None}
+
+        print_result(result, task)
+        score_us = None
+        ok = bool(result.success)
+        err = None
+
+        if ok:
+            try:
+                score_seconds = compute_score(result, task, submission_id=-1)
+                score_us = score_seconds * 1_000_000
+            except Exception as e:
+                ok = False
+                err = f"compute_score failed: {type(e).__name__}: {e}"
+
+        if not ok and err is None:
+            err = str(result.error)
+
+        if print_each:
+            print("\n" + "-" * 60)
+            print(f"[{idx}] ok={ok} score_us={score_us}")
+            if err:
+                print(f"[{idx}] error={err}")
+
+        return {"idx": idx, "ok": ok, "error": err, "score_us": score_us}
+
+    results = await asyncio.gather(*[_run_one(i, item) for i, item in enumerate(items)])
+
+    total = len(results)
+    n_fail = sum(1 for r in results if not r["ok"])
+    fail_pct = 100.0 * n_fail / total if total else 0.0
+
+    scores = [r["score_us"] for r in results if r["ok"] and r["score_us"] is not None]
+
+    print("\n" + "=" * 60)
+    print("AGGREGATE STATS")
+    print("=" * 60)
+    print(f"Total invocations: {total}")
+    print(f"Failed: {n_fail} ({fail_pct:.2f}%)")
+    print(f"Succeeded w/ score: {len(scores)}")
+
+    if scores:
+        print(f"mean score_us:   {statistics.mean(scores):.3f}")
+        print(f"median score_us: {statistics.median(scores):.3f}")
+        print(f"min score_us:    {min(scores):.3f}")
+        print(f"max score_us:    {max(scores):.3f}")
+    else:
+        print("No successful scores to summarize.")
+
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run BioML TriMul submission on Modal using the official task definition.",
+        description="Run BioML TriMul submission(s) on Modal using the official task definition.",
     )
-    parser.add_argument(
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
         "--submission",
         "-s",
-        required=True,
         help="Path to your TriMul submission.py file.",
     )
+    group.add_argument(
+        "--jsonl",
+        "-j",
+        help="Path to JSONL file containing many generated submissions (field: content/submission/code).",
+    )
+
     parser.add_argument(
         "--gpu",
         "-g",
@@ -217,25 +305,55 @@ def parse_args() -> argparse.Namespace:
         choices=[m.value for m in SubmissionMode],
         help="Submission mode (default: test).",
     )
+
+    parser.add_argument(
+        "--concurrency",
+        "-c",
+        type=int,
+        default=8,
+        help="Max number of concurrent Modal invocations for JSONL mode (default: 8).",
+    )
+    parser.add_argument(
+        "--print-each",
+        action="store_true",
+        help="Print per-entry success/score/error while running JSONL mode.",
+    )
     return parser.parse_args()
 
 
 async def main():
     args = parse_args()
 
-    submission_path = Path(args.submission)
-    if not submission_path.exists():
-        raise FileNotFoundError(f"Submission file not found: {submission_path}")
+    # if args.submission:
+    #     submission_path = Path(args.submission)
+    #     if not submission_path.exists():
+    #         raise FileNotFoundError(f"Submission file not found: {submission_path}")
+    #     submission_code = submission_path.read_text()
 
-    submission_code = submission_path.read_text()
+    #     # import pdb; pdb.set_trace()
 
-    result, task = await run_trimul_on_modal(
-        submission_code=submission_code,
+    #     print(submission_code)
+
+    #     result, task = await run_trimul_on_modal(
+    #         submission_code=submission_code,
+    #         gpu_type=args.gpu,
+    #         mode=args.mode,
+    #     )
+    #     print_result(result, task)
+    #     return
+
+    # JSONL mode
+    jsonl_path = Path(args.jsonl)
+    if not jsonl_path.exists():
+        raise FileNotFoundError(f"JSONL file not found: {jsonl_path}")
+
+    await run_jsonl_on_modal(
+        jsonl_path=jsonl_path,
         gpu_type=args.gpu,
         mode=args.mode,
+        concurrency=args.concurrency,
+        print_each=args.print_each,
     )
-
-    print_result(result, task)
 
 
 if __name__ == "__main__":
@@ -243,4 +361,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nInterrupted by user")
-

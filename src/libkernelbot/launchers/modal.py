@@ -42,7 +42,7 @@ class ModalLauncher(Launcher):
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda: modal.Function.from_name("discord-bot-runner", func_name).remote(config=config),
+                lambda: modal.Function.from_name("discord-bot-runner-daniel", func_name).remote(config=config),
             )
         except Exception as e:
             # Best-effort cleanup + surface a structured error instead of crashing the caller.
