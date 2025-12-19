@@ -55,6 +55,55 @@ else
     print_step "Docker already installed"
 fi
 
+# Ensure Docker daemon is running
+print_step "Starting Docker daemon..."
+
+# Stop any existing Docker daemon
+pkill dockerd 2>/dev/null || true
+sleep 1
+
+# Backup existing daemon.json if it exists (to avoid conflicts with --iptables flag)
+if [ -f /etc/docker/daemon.json ]; then
+    print_step "Backing up existing daemon.json to avoid conflicts"
+    cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+    rm /etc/docker/daemon.json
+fi
+
+# Start dockerd directly with iptables disabled (fixes nf_tables permission issues)
+if command -v dockerd &> /dev/null; then
+    dockerd --iptables=false > /tmp/dockerd.log 2>&1 &
+    sleep 3
+else
+    echo "Error: dockerd not found"
+    exit 1
+fi
+
+# Wait for Docker to be ready with retries
+print_step "Waiting for Docker daemon to be ready..."
+MAX_RETRIES=10
+RETRY_COUNT=0
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    if docker info > /dev/null 2>&1; then
+        print_step "Docker daemon is running"
+        break
+    fi
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+        sleep 1
+    fi
+done
+
+# Final check
+if ! docker info > /dev/null 2>&1; then
+    echo "Error: Cannot connect to Docker daemon."
+    echo ""
+    echo "Docker daemon log (last 30 lines):"
+    tail -30 /tmp/dockerd.log 2>&1 || echo "Could not read log"
+    echo ""
+    echo "Docker process: $(pgrep -a dockerd || echo 'not running')"
+    exit 1
+fi
+
 # ==========================================
 # Step 2: Install NVIDIA Container Toolkit (for GPU access in containers)
 # Actually, for AMD, we need to check if RunPod supports GPU passthrough
@@ -71,30 +120,22 @@ else
 fi
 
 # ==========================================
-# Step 3: Clone or download the repository
+# Step 3: Verify Dockerfile exists
 # ==========================================
-print_step "Setting up repository..."
+print_step "Checking for Dockerfile..."
 
-REPO_DIR="/opt/discord-cluster-manager"
-if [ ! -d "$REPO_DIR" ]; then
-    print_step "Cloning repository..."
-    # You'll need to provide the repo URL
-    echo "Please clone your repository to $REPO_DIR"
-    echo "Or if you have it elsewhere, update REPO_DIR in this script"
-    echo ""
-    echo "Example:"
-    echo "  git clone https://github.com/YOUR_ORG/YOUR_REPO.git $REPO_DIR"
-    read -p "Press Enter after you've cloned the repository..."
-else
-    print_step "Repository already exists at $REPO_DIR"
+if [ ! -f "docker/amd-docker.Dockerfile" ]; then
+    echo "Error: docker/amd-docker.Dockerfile not found in current directory"
+    echo "Please run this script from the repository root directory"
+    exit 1
 fi
+
+print_step "Dockerfile found"
 
 # ==========================================
 # Step 4: Build the Docker image
 # ==========================================
 print_step "Building Docker image from docker/amd-docker.Dockerfile..."
-
-cd "$REPO_DIR"
 
 # Build the image
 docker build \
@@ -172,33 +213,33 @@ print_step "Runner script created at /usr/local/bin/start-github-runner.sh"
 # ==========================================
 # Step 6: Alternative: Manual container run instructions
 # ==========================================
-echo ""
-echo "=========================================="
-echo -e "${GREEN}Setup Complete!${NC}"
-echo "=========================================="
-echo ""
-echo "You have two options to run the runner:"
-echo ""
-echo "Option 1: Use the convenience script"
-echo "  /usr/local/bin/start-github-runner.sh"
-echo ""
-echo "Option 2: Run manually"
-echo "  docker run -d \\"
-echo "    --name github-runner-amd \\"
-echo "    --restart unless-stopped \\"
-echo "    --device=/dev/dri \\"
-echo "    --group-add video \\"
-echo "    --group-add render \\"
-echo "    -v /opt/runner-work:/home/runner/_work \\"
-echo "    amd-runner:latest \\"
-echo "    /bin/bash -c 'cd /home/runner && ./config.sh --url YOUR_REPO_URL --token YOUR_TOKEN --name runpod-mi300-x86-64 --work _work && ./run.sh'"
-echo ""
-echo "To get your GitHub token:"
-echo "  Repository → Settings → Actions → Runners → New self-hosted runner"
-echo ""
-echo "To check runner logs:"
-echo "  docker logs -f github-runner-amd"
-echo ""
-echo "To stop the runner:"
-echo "  docker stop github-runner-amd"
-echo ""
+# echo ""
+# echo "=========================================="
+# echo -e "${GREEN}Setup Complete!${NC}"
+# echo "=========================================="
+# echo ""
+# echo "You have two options to run the runner:"
+# echo ""
+# echo "Option 1: Use the convenience script"
+# echo "  /usr/local/bin/start-github-runner.sh"
+# echo ""
+# echo "Option 2: Run manually"
+# echo "  docker run -d \\"
+# echo "    --name github-runner-amd \\"
+# echo "    --restart unless-stopped \\"
+# echo "    --device=/dev/dri \\"
+# echo "    --group-add video \\"
+# echo "    --group-add render \\"
+# echo "    -v /opt/runner-work:/home/runner/_work \\"
+# echo "    amd-runner:latest \\"
+# echo "    /bin/bash -c 'cd /home/runner && ./config.sh --url YOUR_REPO_URL --token YOUR_TOKEN --name runpod-mi300-x86-64 --work _work && ./run.sh'"
+# echo ""
+# echo "To get your GitHub token:"
+# echo "  Repository → Settings → Actions → Runners → New self-hosted runner"
+# echo ""
+# echo "To check runner logs:"
+# echo "  docker logs -f github-runner-amd"
+# echo ""
+# echo "To stop the runner:"
+# echo "  docker stop github-runner-amd"
+# echo ""
