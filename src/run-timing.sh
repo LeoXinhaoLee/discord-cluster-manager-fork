@@ -1,7 +1,7 @@
 #!/bin/bash
 
-export MODAL_TOKEN_ID=ak-EdEEItYIy3bcbiq4B8Z6k8
-export MODAL_TOKEN_SECRET=as-MWhUCJtnn6C2Clxm3fu6oP
+export MODAL_TOKEN_ID=
+export MODAL_TOKEN_SECRET=
 
 set -x
 
