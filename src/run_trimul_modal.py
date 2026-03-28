@@ -139,12 +139,19 @@ def print_result(result: FullResult, task: LeaderboardTask | None = None):
     print(f"Success: {result.success}")
 
     if not result.success:
+        print("\nSystem Info:")
+        if result.system.gpu:
+            print(f"  GPU: {result.system.gpu}")
+        if result.system.cpu:
+            print(f"  CPU: {result.system.cpu}")
+        print(f"  Requeues: {result.system.requeues}")
         print(f"Error: {result.error}")
         return
 
     print("\nSystem Info:")
     print(f"  GPU: {result.system.gpu}")
     print(f"  CPU: {result.system.cpu}")
+    print(f"  Requeues: {result.system.requeues}")
     print(f"  Torch: {result.system.torch}")
     print(f"  Runtime: {result.system.runtime}")
 
